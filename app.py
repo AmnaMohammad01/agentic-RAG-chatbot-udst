@@ -62,14 +62,22 @@ else:
     st.error("FAISS index is missing. Please regenerate embeddings.")
     st.stop()
 
-# Function to get text embeddings
+# Function to get text embeddings with retry for rate limits
 def get_text_embedding(text):
-    try:
-        response = client.embeddings.create(model="mistral-embed", inputs=[text])
-        return np.array(response.data[0].embedding)
-    except Exception as e:
-        st.error(f"Error generating embedding: {e}")
-        return None
+    retries = 5
+    for attempt in range(retries):
+        try:
+            response = client.embeddings.create(model="mistral-embed", inputs=[text])
+            return np.array(response.data[0].embedding)
+        except requests.exceptions.RequestException as e:
+            if "rate limit exceeded" in str(e).lower():
+                wait_time = 2 ** attempt  # Exponential backoff
+                st.warning(f"Rate limit exceeded. Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                st.error(f"Error generating embedding: {e}")
+                return None
+    return None
 
 # **Title Section**
 st.title("UDST Policy Chatbot")
@@ -106,7 +114,7 @@ if question:
                 policy_url = valid_policies[policy_name]
                 st.markdown(f"- [{policy_name}]({policy_url})")
 
-            # Generate response using Mistral
+            # Generate response using Mistral with retry
             prompt = f"""
             Context information is below.
             ---------------------
@@ -117,12 +125,20 @@ if question:
             Answer:
             """
             messages = [UserMessage(content=prompt)]
-            try:
-                response = client.chat.complete(model="mistral-large-latest", messages=messages)
-                answer = response.choices[0].message.content if response.choices else "No response generated."
-            except Exception as e:
-                st.error(f"Error generating response: {e}")
-                answer = "Error: Could not generate response."
+            
+            for attempt in range(5):
+                try:
+                    response = client.chat.complete(model="mistral-large-latest", messages=messages)
+                    answer = response.choices[0].message.content if response.choices else "No response generated."
+                    break
+                except requests.exceptions.RequestException as e:
+                    if "rate limit exceeded" in str(e).lower():
+                        wait_time = 2 ** attempt
+                        st.warning(f"Rate limit exceeded. Retrying in {wait_time} seconds...")
+                        time.sleep(wait_time)
+                    else:
+                        st.error(f"Error generating response: {e}")
+                        answer = "Error: Could not generate response."
 
             st.subheader("Answer")
             st.text_area("Answer:", answer, height=200)
