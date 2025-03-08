@@ -52,74 +52,30 @@ def fetch_policies():
         "Program Accreditation Policy": "https://www.udst.edu.qa/about-udst/institutional-excellence-ie/policies-and-procedures/program-accreditation-policy",
     }
 
-# Function to regenerate FAISS index
-def regenerate_embeddings():
-    policies = fetch_policies()
-    all_chunks = []
-    valid_policies = {}
-
-    for title, url in policies.items():
-        try:
-            response = requests.get(url)
-            if response.status_code == 404:
-                st.warning(f"Skipping {title} (404 Not Found)")
-                continue
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, "html.parser")
-            content = soup.get_text(strip=True)[:2048]  # Limit content size
-            all_chunks.append(content)
-            valid_policies[title] = url
-        except Exception as e:
-            st.error(f"Error fetching {url}: {e}")
-
-    if all_chunks:
-        embeddings = []
-        for chunk in all_chunks:
-            retries = 3
-            for attempt in range(retries):
-                try:
-                    response = client.embeddings.create(model="mistral-embed", inputs=[chunk])
-                    embeddings.append(response.data[0].embedding)
-                    break
-                except Exception as e:
-                    if attempt < retries - 1:
-                        time.sleep(2 ** attempt)  # Exponential backoff
-                    else:
-                        st.error(f"Error generating embeddings: {e}")
-                        return None, None, None
-
-        embeddings = np.array(embeddings)
-        index = faiss.IndexFlatL2(embeddings.shape[1])
-        index.add(embeddings)
-        faiss.write_index(index, FAISS_INDEX_PATH)
-        with open(ALL_CHUNKS_PATH, "wb") as f:
-            pickle.dump(all_chunks, f)
-    else:
-        st.error("No valid policies found. Please check the links.")
-        return None, None, None
-
-    return index, all_chunks, valid_policies
-
-# Load FAISS index and all_chunks if available
+# Load FAISS index and all_chunks
 if os.path.exists(FAISS_INDEX_PATH) and os.path.exists(ALL_CHUNKS_PATH):
-    try:
-        index = faiss.read_index(FAISS_INDEX_PATH)
-        with open(ALL_CHUNKS_PATH, "rb") as f:
-            all_chunks = pickle.load(f)
-        valid_policies = fetch_policies()
-    except Exception as e:
-        st.error(f"Error loading FAISS index: {e}")
-        index, all_chunks, valid_policies = regenerate_embeddings()
+    index = faiss.read_index(FAISS_INDEX_PATH)
+    with open(ALL_CHUNKS_PATH, "rb") as f:
+        all_chunks = pickle.load(f)
+    valid_policies = fetch_policies()
 else:
-    index, all_chunks, valid_policies = regenerate_embeddings()
+    st.error("FAISS index is missing. Please regenerate embeddings.")
+    st.stop()
+
+# Function to get text embeddings
+def get_text_embedding(text):
+    try:
+        response = client.embeddings.create(model="mistral-embed", inputs=[text])
+        return np.array(response.data[0].embedding)
+    except Exception as e:
+        st.error(f"Error generating embedding: {e}")
+        return None
 
 # **Title Section**
 st.title("UDST Policy Chatbot")
 st.write("Ask questions about UDST policies and get relevant answers.")
 
 st.subheader("Available Policies")
-
-# Display policy links as a scrollable list
 st.markdown(
     "<div style='height: 300px; overflow-y: auto; border: 1px solid #ddd; padding: 10px;'>"
     + "<br>".join([f'<a href="{url}" target="_blank">{title}</a>' for title, url in valid_policies.items()])
@@ -135,4 +91,38 @@ if question:
     if index is None or all_chunks is None:
         st.error("FAISS index is not available. Please try again later.")
     else:
-        st.warning("FAISS index loaded successfully.")  # Debugging step
+        question_embedding = get_text_embedding(question)
+        if question_embedding is None:
+            st.error("Failed to generate embedding. Please try again.")
+        else:
+            # Search FAISS for top 3 related policies
+            D, I = index.search(question_embedding.reshape(1, -1), k=3)
+            retrieved_chunks = [all_chunks[i] for i in I.tolist()[0]]
+            
+            # Display top 3 policy links
+            st.subheader("Top 3 Related Policies")
+            for i in I.tolist()[0]:
+                policy_name = list(valid_policies.keys())[i]
+                policy_url = valid_policies[policy_name]
+                st.markdown(f"- [{policy_name}]({policy_url})")
+
+            # Generate response using Mistral
+            prompt = f"""
+            Context information is below.
+            ---------------------
+            {retrieved_chunks}
+            ---------------------
+            Given the context information and not prior knowledge, answer the query.
+            Query: {question}
+            Answer:
+            """
+            messages = [UserMessage(content=prompt)]
+            try:
+                response = client.chat.complete(model="mistral-large-latest", messages=messages)
+                answer = response.choices[0].message.content if response.choices else "No response generated."
+            except Exception as e:
+                st.error(f"Error generating response: {e}")
+                answer = "Error: Could not generate response."
+
+            st.subheader("Answer")
+            st.text_area("Answer:", answer, height=200)
