@@ -125,3 +125,39 @@ for i, title in enumerate(policy_titles):
     with cols[i % 5]:  # Distribute across 5 columns
         st.markdown(f'<a href="{policy_urls[i]}" target="_blank" style="display: block; text-align: center; padding: 10px; background-color: #ffffff; border-radius: 5px; border: 1px solid #ddd; text-decoration: none; color: #000;">{title}</a>', unsafe_allow_html=True)
 
+# **User Query Section**
+st.subheader("Ask a Question")
+question = st.text_input("Enter your question:", "", key="question_input")
+
+if st.button("Get Answer", key="get_answer_button"):
+    if question:
+        if index is None or all_chunks is None:
+            st.error("FAISS index is not available. Please try again later.")
+        else:
+            question_embedding = get_text_embedding([question])
+            if question_embedding is None:
+                st.error("Failed to generate embeddings. Please try again later.")
+            else:
+                question_embedding = np.array(question_embedding)
+                D, I = index.search(question_embedding, k=2)
+                retrieved_chunks = [all_chunks[i] for i in I.tolist()[0]]
+
+                prompt = f"""
+                Context information is below.
+                ---------------------
+                {retrieved_chunks}
+                ---------------------
+                Given the context information and not prior knowledge, answer the query.
+                Query: {question}
+                Answer:
+                """
+                messages = [UserMessage(content=prompt)]
+                try:
+                    response = client.chat.complete(model="mistral-large-latest", messages=messages)
+                    answer = response.choices[0].message.content if response.choices else "No response generated."
+                except Exception as e:
+                    st.error(f"Error generating response: {e}")
+                    answer = "Error: Could not generate response."
+                st.text_area("Answer:", answer, height=200)
+    else:
+        st.warning("Please enter a question.")
