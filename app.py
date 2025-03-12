@@ -1,4 +1,4 @@
-import streamlit as st 
+import streamlit as st
 import os
 import time
 import requests
@@ -40,7 +40,6 @@ def fetch_policies():
         "International Student Procedure": "https://www.udst.edu.qa/about-udst/institutional-excellence-ie/udst-policies-and-procedures/international-student-procedure",
         "Registration Policy": "https://www.udst.edu.qa/about-udst/institutional-excellence-ie/policies-and-procedures/registration-policy",
         "Registration Procedure": "https://www.udst.edu.qa/about-udst/institutional-excellence-ie/policies-and-procedures/registration-procedure",
-        # Newly Added Policies
         "Academic Annual Leave Policy": "https://www.udst.edu.qa/about-udst/institutional-excellence-ie/policies-and-procedures/academic-annual-leave-policy",
         "Academic Appraisal Policy": "https://www.udst.edu.qa/about-udst/institutional-excellence-ie/policies-and-procedures/academic-appraisal-policy",
         "Academic Credentials Policy": "https://www.udst.edu.qa/about-udst/institutional-excellence-ie/policies-and-procedures/academic-credentials-policy",
@@ -52,15 +51,71 @@ def fetch_policies():
         "Program Accreditation Policy": "https://www.udst.edu.qa/about-udst/institutional-excellence-ie/policies-and-procedures/program-accreditation-policy",
     }
 
-# Load FAISS index and all_chunks
+# Function to regenerate FAISS index if missing
+def regenerate_embeddings():
+    policies = fetch_policies()
+    all_chunks = []
+    valid_policies = {}
+
+    for title, url in policies.items():
+        try:
+            response = requests.get(url)
+            if response.status_code == 404:
+                st.warning(f"Skipping {title} (404 Not Found)")
+                continue
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "html.parser")
+            content = soup.get_text(strip=True)[:2048]  # Limit content size
+            all_chunks.append(content)
+            valid_policies[title] = url
+        except Exception as e:
+            st.error(f"Error fetching {url}: {e}")
+
+    if all_chunks:
+        embeddings = []
+        for chunk in all_chunks:
+            retries = 3
+            for attempt in range(retries):
+                try:
+                    response = client.embeddings.create(model="mistral-embed", inputs=[chunk])
+                    embeddings.append(response.data[0].embedding)
+                    break
+                except Exception as e:
+                    if attempt < retries - 1:
+                        time.sleep(2 ** attempt)  # Exponential backoff
+                    else:
+                        st.error(f"Error generating embeddings: {e}")
+                        return None, None, None
+
+        embeddings = np.array(embeddings)
+        index = faiss.IndexFlatL2(embeddings.shape[1])
+        index.add(embeddings)
+        faiss.write_index(index, FAISS_INDEX_PATH)
+        with open(ALL_CHUNKS_PATH, "wb") as f:
+            pickle.dump(all_chunks, f)
+    else:
+        st.error("No valid policies found. Please check the links.")
+        return None, None, None
+
+    return index, all_chunks, valid_policies
+
+# Check if FAISS index exists; otherwise, regenerate
 if os.path.exists(FAISS_INDEX_PATH) and os.path.exists(ALL_CHUNKS_PATH):
-    index = faiss.read_index(FAISS_INDEX_PATH)
-    with open(ALL_CHUNKS_PATH, "rb") as f:
-        all_chunks = pickle.load(f)
-    valid_policies = fetch_policies()
+    try:
+        index = faiss.read_index(FAISS_INDEX_PATH)
+        with open(ALL_CHUNKS_PATH, "rb") as f:
+            all_chunks = pickle.load(f)
+        valid_policies = fetch_policies()
+    except Exception as e:
+        st.warning("FAISS index is corrupt. Regenerating embeddings...")
+        index, all_chunks, valid_policies = regenerate_embeddings()
 else:
-    st.error("FAISS index is missing. Please regenerate embeddings.")
-    st.stop()
+    st.warning("FAISS index is missing. Regenerating embeddings...")
+    index, all_chunks, valid_policies = regenerate_embeddings()
+
+st.success("FAISS index loaded successfully!")
+
+
 
 # Function to get text embeddings with retry for rate limits
 def get_text_embedding(text):
